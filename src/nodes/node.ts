@@ -3,46 +3,196 @@ import express from "express";
 import { BASE_NODE_PORT } from "../config";
 import { Value } from "../types";
 
+type NodeState = {
+  killed: boolean;
+  x: 0 | 1 | "?" | null;
+  decided: boolean | null;
+  k: number | null;
+};
+
+function countVotes(values: Iterable<Value>) {
+  const counts: Record<Value, number> = { 0: 0, 1: 0, "?": 0 };
+  for (const v of values) {
+    if (isValidValue(v)) counts[v]++;
+  }
+  return counts;
+}
+
+function decideFromCounts(counts: Record<Value, number>, threshold: number): Value | null {
+  if (counts[0] > threshold) return 0;
+  if (counts[1] > threshold) return 1;
+  return null;
+}
+
+function isValidValue(v: any): v is Value {
+  return v === 0 || v === 1 || v === "?";
+}
+
 export async function node(
-  nodeId: number, // the ID of the node
-  N: number, // total number of nodes in the network
-  F: number, // number of faulty nodes in the network
-  initialValue: Value, // initial value of the node
-  isFaulty: boolean, // true if the node is faulty, false otherwise
-  nodesAreReady: () => boolean, // used to know if all nodes are ready to receive requests
-  setNodeIsReady: (index: number) => void // this should be called when the node is started and ready to receive requests
+  nodeId: number,
+  N: number,
+  F: number,
+  initialValue: Value,
+  isFaulty: boolean,
+  nodesAreReady: () => boolean,
+  setNodeIsReady: (index: number) => void
 ) {
-  const node = express();
-  node.use(express.json());
-  node.use(bodyParser.json());
+  const app = express();
+  app.use(express.json());
+  app.use(bodyParser.json());
 
-  // TODO implement this
-  // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  const state: NodeState = {
+    killed: false,
+    x: isFaulty ? null : initialValue,
+    decided: isFaulty ? null : false,
+    k: isFaulty ? null : 0,
+  };
 
-  // TODO implement this
-  // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
+  const messages: {
+    [round: number]: {
+      phase1: Map<number, Value>;
+      phase2: Map<number, Value>;
+    };
+  } = {};
 
-  // TODO implement this
-  // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
+  let running = false;
 
-  // TODO implement this
-  // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
+  app.get("/status", (_req, res) => {
+    return isFaulty
+      ? res.status(500).send("faulty")
+      : res.status(200).send("live");
+  });
 
-  // TODO implement this
-  // get the current state of a node
-  // node.get("/getState", (req, res) => {});
+  app.get("/getState", (_req, res) => {
+    return res.status(200).json({
+      killed: state.killed,
+      x: isFaulty ? null : state.x,
+      decided: isFaulty ? null : state.decided,
+      k: isFaulty ? null : state.k,
+    });
+  });
 
-  // start the server
-  const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
-    console.log(
-      `Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`
-    );
+  app.post("/message", (req, res) => {
+    if (isFaulty || state.killed || state.decided) return res.sendStatus(200);
 
-    // the node is ready
+    const { round, phase, sender, value } = req.body;
+
+    if (!messages[round]) {
+      messages[round] = {
+        phase1: new Map(),
+        phase2: new Map(),
+      };
+    }
+
+    if (phase === 1) messages[round].phase1.set(sender, value);
+    else if (phase === 2) messages[round].phase2.set(sender, value);
+
+    return res.sendStatus(200);
+  });
+
+  const broadcastToAllNodes = async (
+    round: number,
+    phase: 1 | 2,
+    sender: number,
+    value: Value
+  ) => {
+    const body = {
+      sender,
+      round,
+      phase,
+      value,
+    };
+    for (let i = 0; i < N; i++) {
+      if (i === sender) continue;
+      try {
+        await fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch {
+        // Network failure or node down — ignore
+      }
+    }
+  };
+
+  app.get("/start", async (_req, res) => {
+    if (isFaulty || running) return res.send("OK");
+    running = true;
+
+    (async () => {
+      while (!state.killed && !state.decided) {
+        state.k = (state.k ?? 0) + 1;
+        const round = state.k;
+
+        if (!messages[round]) {
+          messages[round] = {
+            phase1: new Map(),
+            phase2: new Map(),
+          };
+        }
+
+        // PHASE 1
+        const proposal = state.x ?? (Math.random() < 0.5 ? 0 : 1);
+        messages[round].phase1.set(nodeId, proposal);
+        await broadcastToAllNodes(round, 1, nodeId, proposal);
+
+        while (
+          messages[round].phase1.size < N - F &&
+          !state.killed &&
+          !state.decided
+        ) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+
+        const phase1Counts = countVotes(messages[round].phase1.values());
+        let b: Value = "?";
+        if (phase1Counts[0] > N / 2) b = 0;
+        else if (phase1Counts[1] > N / 2) b = 1;
+
+        // PHASE 2
+        messages[round].phase2.set(nodeId, b);
+        await broadcastToAllNodes(round, 2, nodeId, b);
+
+        while (
+          messages[round].phase2.size < N - F &&
+          !state.killed &&
+          !state.decided
+        ) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+
+        const phase2Counts = countVotes(messages[round].phase2.values());
+        const decision = decideFromCounts(phase2Counts, F);
+
+        if (decision !== null) {
+          state.x = decision;
+          state.decided = true;
+          break;
+        }
+
+        // No decision yet, update proposal or random
+        if (phase2Counts[0] > 0 || phase2Counts[1] > 0) {
+          state.x = phase2Counts[0] >= phase2Counts[1] ? 0 : 1;
+        } else {
+          state.x = Math.random() < 0.5 ? 0 : 1;
+        }
+      }
+
+      running = false;
+    })();
+
+    return res.send("OK");
+  });
+
+  app.get("/stop", (_req, res) => {
+    state.killed = true;
+    running = false;
+    return res.send("OK");
+  });
+
+  const server = app.listen(BASE_NODE_PORT + nodeId, () => {
+    console.log(`Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`);
     setNodeIsReady(nodeId);
   });
 
